@@ -46,3 +46,8 @@ The HTTP test uses a local TCP server; it does not touch the network.
 Run `auro new` in a separate empty directory, then `auro dev`, on a machine or account that has not
 built Auro before. Record the time to the first window and any missing system package. That is the
 external test tracked in the Auro repository issue #14.
+
+## License
+
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
