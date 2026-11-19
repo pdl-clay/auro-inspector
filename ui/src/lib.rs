@@ -7,6 +7,7 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use auro::gpui::{App as GpuiApp, AppContext, Entity, Global, ScrollHandle};
@@ -20,8 +21,10 @@ use gpui_component::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PREVIEW_BYTES: usize = 64 * 1024;
 const MAX_HISTORY: usize = 100;
+const MAX_SAVED_REQUESTS: usize = 50;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HistoryEntry {
@@ -32,19 +35,30 @@ struct HistoryEntry {
     at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SavedRequest {
+    method: String,
+    url: String,
+    body: String,
+    at: String,
+}
+
 #[derive(Clone, Debug)]
 struct ResponseView {
     status: u16,
     reason: String,
     headers: String,
-    body: String,
+    body: Arc<[u8]>,
     pretty: String,
     duration_ms: u64,
+    size_bytes: usize,
+    truncated: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct InspectorModel {
     history: Vec<HistoryEntry>,
+    saved: Vec<SavedRequest>,
     response: Option<ResponseView>,
     loading: bool,
     message: Option<String>,
@@ -92,7 +106,70 @@ fn save_history(history: &[HistoryEntry]) {
     }
 }
 
-fn export_body(body: &str) -> Result<PathBuf, String> {
+fn collection_path() -> PathBuf {
+    data_dir().join("collection.json")
+}
+
+fn load_collection() -> Vec<SavedRequest> {
+    let path = collection_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_else(|error| {
+        eprintln!(
+            "auro-inspector: ignoring unreadable collection {}: {error}",
+            path.display()
+        );
+        Vec::new()
+    })
+}
+
+fn save_collection(requests: &[SavedRequest]) {
+    let path = collection_path();
+    let result = path
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| serde_json::to_vec_pretty(requests).map_err(std::io::Error::other))
+        .and_then(|bytes| fs::write(&path, bytes));
+    if let Err(error) = result {
+        eprintln!("auro-inspector: collection write failed: {error}");
+    }
+}
+
+fn truncate_preview(text: &str) -> String {
+    let mut end = text.len().min(MAX_PREVIEW_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut preview = text[..end].to_owned();
+    if text.len() > MAX_PREVIEW_BYTES {
+        preview.push_str("\n... [preview truncated]");
+    }
+    preview
+}
+
+fn preview_body(body: &[u8]) -> String {
+    let end = body.len().min(MAX_PREVIEW_BYTES);
+    let mut preview = String::from_utf8_lossy(&body[..end]).into_owned();
+    if body.len() > MAX_PREVIEW_BYTES {
+        preview.push_str("\n... [preview truncated]");
+    }
+    preview
+}
+
+fn human_size(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn export_body(body: &[u8]) -> Result<PathBuf, String> {
     let dir = data_dir().join("exports");
     fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let stamp = SystemTime::now()
@@ -149,24 +226,40 @@ fn perform_request(method: &str, url: &str, body: &str) -> Result<ResponseView, 
         .map(|(name, value)| format!("{}: {}", name, value.to_str().unwrap_or("<binary header>")))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut body_text = String::new();
+    let mut body = Vec::new();
     response
         .body_mut()
         .as_reader()
-        .take(MAX_RESPONSE_BYTES)
-        .read_to_string(&mut body_text)
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut body)
         .map_err(|error| error.to_string())?;
-    let pretty = serde_json::from_str::<Value>(&body_text)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| body_text.clone());
+    let truncated = body.len() as u64 > MAX_RESPONSE_BYTES;
+    if truncated {
+        body.truncate(MAX_RESPONSE_BYTES as usize);
+    }
+    let size_bytes = body.len();
+    let pretty = if size_bytes <= MAX_PREVIEW_BYTES {
+        serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .map(|text| truncate_preview(&text))
+            .unwrap_or_else(|| preview_body(&body))
+    } else {
+        let mut preview = preview_body(&body);
+        if truncated {
+            preview.push_str("\n... [response larger than 64 MiB; body truncated]");
+        }
+        preview
+    };
     Ok(ResponseView {
         status,
         reason,
         headers,
-        body: body_text,
+        body: Arc::from(body),
         pretty,
         duration_ms: started.elapsed().as_millis() as u64,
+        size_bytes,
+        truncated,
     })
 }
 
@@ -209,6 +302,18 @@ impl InspectorView {
                 .multi_line(true)
                 .rows(5)
         });
+        let last = model.read(cx).saved.first().cloned();
+        if let Some(last) = last {
+            method.update(cx, |state, cx| {
+                state.set_value(last.method.clone(), window, cx);
+            });
+            url.update(cx, |state, cx| {
+                state.set_value(last.url.clone(), window, cx);
+            });
+            body.update(cx, |state, cx| {
+                state.set_value(last.body.clone(), window, cx);
+            });
+        }
         cx.observe(&model, |_, _, cx| cx.notify()).detach();
         InspectorView {
             model,
@@ -229,6 +334,62 @@ impl InspectorView {
             state.set_value(entry.url.clone(), window, cx);
         });
         cx.notify();
+    }
+
+    fn load_saved(&mut self, request: &SavedRequest, window: &mut Window, cx: &mut Context<Self>) {
+        self.method.update(cx, |state, cx| {
+            state.set_value(request.method.clone(), window, cx);
+        });
+        self.url.update(cx, |state, cx| {
+            state.set_value(request.url.clone(), window, cx);
+        });
+        self.body.update(cx, |state, cx| {
+            state.set_value(request.body.clone(), window, cx);
+        });
+        self.model.update(cx, |model, cx| {
+            model.message = Some("loaded saved request".to_owned());
+            cx.notify();
+        });
+    }
+
+    fn save_request(&mut self, cx: &mut Context<Self>) {
+        let method = self.method.read(cx).value().trim().to_uppercase();
+        let method = if method.is_empty() {
+            "GET".to_owned()
+        } else {
+            method
+        };
+        let url = self.url.read(cx).value().trim().to_owned();
+        if url.is_empty() {
+            self.model.update(cx, |model, cx| {
+                model.message = Some("enter a URL before saving".to_owned());
+                cx.notify();
+            });
+            return;
+        }
+        let request = SavedRequest {
+            method,
+            url,
+            body: self.body.read(cx).value().to_string(),
+            at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        let mut saved = self.model.read(cx).saved.clone();
+        saved.retain(|entry| {
+            !(entry.method == request.method
+                && entry.url == request.url
+                && entry.body == request.body)
+        });
+        saved.insert(0, request);
+        saved.truncate(MAX_SAVED_REQUESTS);
+        self.model.update(cx, |model, cx| {
+            model.saved = saved.clone();
+            model.message = Some("saved request".to_owned());
+            cx.notify();
+        });
+        cx.spawn(async move |_this, _cx| {
+            let _ = smol::unblock(move || save_collection(&saved)).await;
+        })
+        .detach();
     }
 
     fn clear_history(&mut self, cx: &mut Context<Self>) {
@@ -318,7 +479,7 @@ impl InspectorView {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let result = smol::unblock(move || export_body(&response.body)).await;
+            let result = smol::unblock(move || export_body(response.body.as_ref())).await;
             this.update(cx, |this, cx| {
                 this.model.update(cx, |model, cx| {
                     model.message = Some(match result {
@@ -353,10 +514,11 @@ impl Render for InspectorView {
         };
         self.last_data = Some(data.clone());
 
-        let (history, response, loading, message) = {
+        let (history, saved, response, loading, message) = {
             let model = self.model.read(cx);
             (
                 model.history.clone(),
+                model.saved.clone(),
                 model.response.clone(),
                 model.loading,
                 model.message.clone(),
@@ -398,6 +560,32 @@ impl Render for InspectorView {
             })
             .collect::<Vec<_>>();
 
+        let saved_rows = saved
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let request = request.clone();
+                h_flex()
+                    .id(("saved", index))
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .hover(|style| style.bg(theme.muted))
+                    .child(
+                        div()
+                            .w_10()
+                            .text_color(theme.muted_foreground)
+                            .child(request.method.clone()),
+                    )
+                    .child(div().flex_1().child(request.url.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.load_saved(&request, window, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
+
         let status_line = response.as_ref().map(|response| {
             let color = match response.status {
                 200..=299 => theme.green,
@@ -417,7 +605,16 @@ impl Render for InspectorView {
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.muted_foreground)
-                        .child(format!("{} ms", response.duration_ms)),
+                        .child(format!(
+                            "{} ms · {}{}",
+                            response.duration_ms,
+                            human_size(response.size_bytes),
+                            if response.truncated {
+                                " · 64 MiB cap"
+                            } else {
+                                ""
+                            }
+                        )),
                 )
         });
 
@@ -492,6 +689,11 @@ impl Render for InspectorView {
                                     .on_click(cx.listener(|this, _, _, cx| this.send(cx))),
                             )
                             .child(
+                                KitButton::new("save")
+                                    .label("Save")
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_request(cx))),
+                            )
+                            .child(
                                 KitButton::new("export")
                                     .label("Export")
                                     .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
@@ -514,8 +716,8 @@ impl Render for InspectorView {
                         div()
                             .text_size(px(12.0))
                             .text_color(theme.muted_foreground)
-                            .child(message.clone().unwrap_or_else(|| {
-                                "GET is the default; click a history entry to load it.".to_owned()
+                                    .child(message.clone().unwrap_or_else(|| {
+                                "GET is the default; Save keeps the request; click a history entry to load it.".to_owned()
                             })),
                     ),
             )
@@ -546,6 +748,38 @@ impl Render for InspectorView {
                             .h_full()
                             .border_l_1()
                             .border_color(theme.border)
+                            .child(
+                                h_flex()
+                                    .px_3()
+                                    .pt_3()
+                                    .pb_1()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_size(px(16.0)).child("Saved"))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(saved.len().to_string()),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("saved-scroll")
+                                    .max_h(px(180.0))
+                                    .overflow_y_scroll()
+                                    .px_2()
+                                    .when(saved.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .p_2()
+                                                .text_size(px(12.0))
+                                                .text_color(theme.muted_foreground)
+                                                .child("Save a request to keep it here."),
+                                        )
+                                    })
+                                    .children(saved_rows),
+                            )
                             .child(
                                 h_flex()
                                     .p_3()
@@ -664,6 +898,7 @@ pub fn run(data: fn() -> HotData) {
             KitTheme::change(ThemeMode::Dark, None, cx);
             let model = cx.new(|_| InspectorModel {
                 history: load_history(),
+                saved: load_collection(),
                 ..InspectorModel::default()
             });
             cx.set_global(ModelGlobal(model));
@@ -710,6 +945,67 @@ mod tests {
         assert_eq!(response.reason, "OK");
         assert!(response.pretty.contains("\"ok\": true"));
         assert!(response.headers.to_lowercase().contains("content-type"));
+        assert!(response.body.len() > 0);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn saved_requests_round_trip_through_json() {
+        let saved = vec![
+            SavedRequest {
+                method: "GET".to_owned(),
+                url: "https://example.test/items".to_owned(),
+                body: String::new(),
+                at: "2026-11-19 03:00:00".to_owned(),
+            },
+            SavedRequest {
+                method: "POST".to_owned(),
+                url: "https://example.test/items".to_owned(),
+                body: "{\"name\":\"x\"}".to_owned(),
+                at: "2026-11-19 03:01:00".to_owned(),
+            },
+        ];
+        let text = serde_json::to_string(&saved).expect("serialize");
+        let decoded: Vec<SavedRequest> = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(decoded, saved);
+    }
+
+    #[test]
+    fn handles_a_50_mb_json_response_with_a_bounded_preview() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let target = 50 * 1024 * 1024;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+
+            let mut body = String::with_capacity(target + 16);
+            body.push_str("{\"items\":[");
+            while body.len() < target {
+                body.push_str("0,");
+            }
+            body.push_str("0]}");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("headers");
+            stream.write_all(body.as_bytes()).expect("body");
+        });
+
+        let response = perform_request("GET", &format!("http://{address}/"), "").expect("request");
+        assert_eq!(response.status, 200);
+        assert!(
+            response.size_bytes >= target,
+            "got {} bytes, expected at least {}",
+            response.size_bytes,
+            target
+        );
+        assert_eq!(response.body.len(), response.size_bytes);
+        assert!(response.pretty.len() <= MAX_PREVIEW_BYTES + 64);
+        assert!(response.pretty.contains("\"items\""));
         server.join().expect("server");
     }
 }
