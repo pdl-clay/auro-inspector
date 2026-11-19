@@ -1,0 +1,28 @@
+[app]
+identifier = "com.pdl.auroinspector"
+product-name = "Auro Inspector"
+version = "0.1.0"
+
+[[app.windows]]
+label = "main"
+title = "Auro Inspector"
+width = 1180
+height = 780
+theme = "dark"
+
+[[app.windows]]
+label = "history"
+title = "Auro Inspector - History"
+width = 560
+height = 720
+theme = "dark"
+
+[dev]
+# `types` is the shared shape; a change there is a restart, not a hot patch.
+watch = ["src", "ui/src", "data/src", "types/src", "Auro.toml"]
+# `hot = true` runs the hot-patch devserver instead of rebuilding and relaunching.
+hot = false
+
+[bundle]
+# A 512x512 placeholder shipped by `auro new`; replace it with the app's own icon.
+icon = ["icons/icon.png"]

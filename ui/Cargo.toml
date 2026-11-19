@@ -1,0 +1,18 @@
+[package]
+name = "auro-inspector-ui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+auro = "0.1.0-alpha.1"
+auro-inspector-types = { path = "../types" }
+chrono = "0.4"
+gpui-component = "=0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol = "2"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[features]
+hot-reload = ["auro/hot-reload"]

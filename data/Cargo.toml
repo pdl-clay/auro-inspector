@@ -1,0 +1,12 @@
+[package]
+name = "auro-inspector-data"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+auro-inspector-types = { path = "../types" }
+
+# Keep this crate free of framework dependencies. `dx` recompiles a changed crate and its
+# dependents; the UI crate does not depend on this one, so editing the boundary here rebuilds only
+# this crate and the thin bin -- not GPUI, the view, or the window code.

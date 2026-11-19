@@ -1,0 +1,3 @@
+[application]
+name = "auro-inspector"
+default_platform = "desktop"

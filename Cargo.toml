@@ -1,0 +1,33 @@
+[package]
+name = "auro-inspector"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+auro-inspector-ui = { path = "ui" }
+auro-inspector-data = { path = "data" }
+
+[features]
+hot-reload = ["auro-inspector-ui/hot-reload"]
+
+# `dx serve` builds this adhoc profile (the Dioxus CLI keeps it separate from `dev`). Hot reload
+# relinks the app crate on every save and DWARF dominates that link; `debug_assertions` stays on,
+# which is what subsecond requires. Keep debug info out of the hot path, use `[profile.dev]` when
+# you need a debugger.
+[profile.desktop-dev]
+inherits = "dev"
+debug = 0
+# ThinLink relinks the whole tip crate per patch; on the demo app its 1-file builds were
+# consistently faster without an incremental session (measured).
+incremental = false
+
+# The documented binary-size method is a release build with symbols stripped. `panic = "abort"`
+# is deliberately not set: hot reload catches a panicking boundary so the previous UI stays alive.
+[profile.release]
+strip = "symbols"
+
+# Its own workspace: a parent manifest must never capture the generated app.
+[workspace]
+members = [".", "ui", "data", "types"]
+
